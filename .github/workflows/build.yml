@@ -1,0 +1,35 @@
+name: Build spring_fix.dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build arm64 dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang \
+            -fobjc-arc \
+            -fvisibility=hidden \
+            -O2 \
+            -isysroot "$SDK" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -framework Foundation \
+            -install_name @rpath/spring_fix.dylib \
+            -o spring_fix.dylib \
+            spring_fix.m
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring_fix.dylib
+          path: spring_fix.dylib
