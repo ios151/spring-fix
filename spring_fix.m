@@ -1,10 +1,12 @@
 // spring_fix.dylib — fixes iOS 27.2 beta startup crashes in Spring for Twitter
 //
-// Root cause: +[CKContainer containerWithIdentifier:] internally throws on iOS 27.2 beta.
-// arm64 @try/@catch cannot intercept arm64e exceptions (unwinder PAC boundary issue).
+// Root cause: CloudKit's internal dispatch_once block (+56600) throws on iOS 27.2 beta.
+// arm64 @try/@catch cannot catch arm64e exceptions (PAC unwinder boundary).
 //
-// Fix 3 strategy: bypass CloudKit init entirely by pre-setting dispatch_once token to DONE
-// and pointing CloudKitManager.shared at a zeroed stub. ObjC nil-message safety handles the rest.
+// Strategy: pre-set every relevant dispatch_once token to DONE so the failing block
+// never executes. Two paths are fixed:
+//   (A) JonnyTwitterKit path: qword_4DC230 token → sub_5DE74/sub_5DE90 never runs
+//   (B) CKMainBundleIsAppleExecutable path: scan function body for ADRP+ADD X0 → DONE
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -56,40 +58,122 @@ static void hooked_setDelegate(PKPushRegistry *self, SEL cmd, id<PKPushRegistryD
     orig_setDelegate(self, cmd, d);
 }
 
-// ---- Fix 3: CloudKit dispatch_once bypass ----------------------------------
-// JonnyTwitterKit binary offsets (IDA base = 0x0):
-//   qword_4DC230  = swift_once token for CloudKitManager init (sub_5DE74)
-//   0x4FF8B8      = CloudKitManager.shared storage
-//
-// Strategy: pre-mark token as DONE so sub_5DE74 never executes,
-//           and point shared at a zeroed stub so *(shared+N) = nil for all N.
-//           ObjC nil messages are no-ops; CloudKit features degrade gracefully.
+// ---- Fix 3 helpers ---------------------------------------------------------
 
-#define JTK_ONCE_TOKEN_OFFSET  0x4DC230
-#define JTK_SHARED_OFFSET      0x4FF8B8
+// Decode ARM64 ADRP X0 + ADD X0, X0, #imm12 pair at insns[i..i+1]
+// Returns target address or 0 if pattern doesn't match
+static uintptr_t decode_adrp_add_x0(const uint32_t *insns, int i) {
+    uint32_t a = insns[i], b = insns[i + 1];
+    // ADRP X0: bits[31:29]=1|immlo, bits[28:24]=10000, bits[4:0]=0
+    if ((a & 0x9F00001F) != 0x90000000) return 0;
+    // ADD X0, X0, #imm12: sf=1,op=0,S=0,bits[28:24]=10001, Rn=0,Rd=0
+    if ((b & 0xFFC003FF) != 0x91000000) return 0;
 
-// 0xD0 = CloudKitManager's swift_allocObject requiredSize from sub_5DE90
+    uintptr_t pc = (uintptr_t)&insns[i];
+    int64_t immlo = (a >> 29) & 0x3;
+    int64_t immhi = (a >> 5) & 0x7FFFF;
+    int64_t imm = (immhi << 2) | immlo;
+    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1LL);
+    imm <<= 12;
+
+    uintptr_t page = (pc & ~(uintptr_t)0xFFF) + (uintptr_t)imm;
+    uint64_t imm12 = (b >> 10) & 0xFFF;
+    int shift = (b >> 22) & 0x3;
+    if (shift == 1) imm12 <<= 12;
+
+    return page + imm12;
+}
+
+// Scan `max_insns` instructions at `fn` for ADRP+ADD X0 pattern.
+// For each candidate token address inside [data_lo, data_hi), set to DONE.
+// Returns count of tokens patched.
+static int patch_dispatch_once_tokens_in(const void *fn, int max_insns,
+                                          uintptr_t data_lo, uintptr_t data_hi) {
+    const uint32_t *p = (const uint32_t *)fn;
+    int count = 0;
+    for (int i = 0; i < max_insns - 1; i++) {
+        uintptr_t t = decode_adrp_add_x0(p, i);
+        if (t && t >= data_lo && t < data_hi) {
+            volatile int64_t *tok = (volatile int64_t *)t;
+            if (*tok != ~0LL) {
+                *tok = ~0LL;
+                NSLog(@"[spring_fix] CK dispatch_once token @%p DONE (from fn+%d)", (void *)t, i * 4);
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// ---- Fix 3A: JonnyTwitterKit CloudKitManager bypass -----------------------
+// JonnyTwitterKit binary offsets (IDA base=0x0)
+#define JTK_ONCE_TOKEN_OFFSET  0x4DC230   // qword_4DC230: guards sub_5DE74
+#define JTK_SHARED_OFFSET      0x4FF8B8   // CloudKitManager.shared storage
 static uint8_t _ck_stub[0xD0] __attribute__((aligned(16)));
 
-static void setup_cloudkit_bypass(void) {
+static void setup_jtk_bypass(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name || !strstr(name, "JonnyTwitterKit")) continue;
 
         uintptr_t base = (uintptr_t)_dyld_get_image_header(i);
+        *(volatile int64_t *)(base + JTK_ONCE_TOKEN_OFFSET) = ~0LL;
+        *(void *volatile *)(base + JTK_SHARED_OFFSET) = _ck_stub;
 
-        // Mark dispatch_once token as DONE (~0 = DLOCK_ONCE_DONE)
-        volatile int64_t *token = (volatile int64_t *)(base + JTK_ONCE_TOKEN_OFFSET);
-        *token = ~0LL;
-
-        // Point CloudKitManager.shared at our zeroed stub (non-nil)
-        void *volatile *shared = (void *volatile *)(base + JTK_SHARED_OFFSET);
-        *shared = _ck_stub;
-
-        NSLog(@"[spring_fix] CloudKit bypass: base=%p token=%p shared=%p",
-              (void *)base, (void *)token, (void *)shared);
+        NSLog(@"[spring_fix] JTK CloudKitManager bypass at base %p", (void *)base);
         break;
+    }
+}
+
+// ---- Fix 3B: CloudKit CKMainBundleIsAppleExecutable bypass ----------------
+// CloudKit's internal dispatch_once block (+56600) throws on iOS 27.2 beta.
+// CKMainBundleIsAppleExecutable is a public symbol that uses dispatch_once
+// with this block (directly or transitively). Scan its function body and
+// any other known CloudKit entry points for dispatch_once tokens and DONE them.
+
+static void setup_cloudkit_bypass(void) {
+    dlopen("/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_LAZY | RTLD_GLOBAL);
+
+    // Get CloudKit data segment bounds for sanity-checking token addresses
+    uintptr_t ck_base = 0;
+    uint32_t img_count = _dyld_image_count();
+    for (uint32_t i = 0; i < img_count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "/CloudKit.framework/CloudKit")) continue;
+        ck_base = (uintptr_t)_dyld_get_image_header(i);
+        break;
+    }
+    if (!ck_base) {
+        NSLog(@"[spring_fix] CloudKit not found in image list");
+        return;
+    }
+
+    // CloudKit data range (rough estimate: base + 4MB to base + 8MB covers __data/__bss)
+    uintptr_t data_lo = ck_base + 0x400000;
+    uintptr_t data_hi = ck_base + 0x800000;
+
+    // Patch dispatch_once tokens in CKMainBundleIsAppleExecutable (public symbol)
+    void *fn = dlsym(RTLD_DEFAULT, "CKMainBundleIsAppleExecutable");
+    if (fn) {
+        int n = patch_dispatch_once_tokens_in(fn, 128, data_lo, data_hi);
+        NSLog(@"[spring_fix] CKMainBundleIsAppleExecutable: patched %d token(s)", n);
+    }
+
+    // Also scan 32 instructions at CloudKit +2357836 (inner dispatch_once call site)
+    // offset seen in crash log: CloudKit +2357836 calls dispatch_once with block +56600
+    uintptr_t inner_site = ck_base + 2357836;
+    const uint32_t *p = (const uint32_t *)inner_site;
+    for (int i = -16; i < 4; i++) {
+        uintptr_t t = decode_adrp_add_x0(p, i);
+        if (t && t >= data_lo && t < data_hi) {
+            volatile int64_t *tok = (volatile int64_t *)t;
+            if (*tok != ~0LL) {
+                *tok = ~0LL;
+                NSLog(@"[spring_fix] CK inner token @%p DONE (site+%d)", (void *)t, i * 4);
+            }
+            break;
+        }
     }
 }
 
@@ -115,7 +199,10 @@ static void spring_fix_init(void) {
         }
     }
 
-    // Fix 3
+    // Fix 3A: JonnyTwitterKit CloudKitManager
     memset(_ck_stub, 0, sizeof(_ck_stub));
+    setup_jtk_bypass();
+
+    // Fix 3B: CloudKit internal dispatch_once tokens
     setup_cloudkit_bypass();
 }
