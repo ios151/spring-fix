@@ -1,21 +1,18 @@
 // spring_fix.dylib — fixes iOS 27.2 beta startup crashes in Spring for Twitter
 //
-// Root cause: +[CKContainer containerWithIdentifier:] internally hits a
-// dispatch_once block (CloudKit +56600) that throws an NSException on iOS 27.2
-// beta. The exception propagates from CloudKit (ObjC/C) through Swift frames in
-// JonnyTwitterKit / JonnySocialKit → std::terminate → SIGABRT.
+// Root cause: +[CKContainer containerWithIdentifier:] internally throws on iOS 27.2 beta.
+// arm64 @try/@catch cannot intercept arm64e exceptions (unwinder PAC boundary issue).
 //
-// Fix strategy:
-//  1. cloudKitContainerOptions → nil  (CoreData path, belt-and-suspenders)
-//  2. PKPushRegistry delegate proxy with @try/@catch (push-credentials path)
-//  3. Swizzle +[CKContainer containerWithIdentifier:] with @try/@catch
-//     Exception caught at ObjC level before it ever reaches Swift frames.
-//     Returns nil on failure; CloudKit features degrade gracefully.
+// Fix 3 strategy: bypass CloudKit init entirely by pre-setting dispatch_once token to DONE
+// and pointing CloudKitManager.shared at a zeroed stub. ObjC nil-message safety handles the rest.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <PushKit/PushKit.h>
 #import <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <string.h>
+#include <stdint.h>
 
 // ---- Fix 1: CoreData CloudKit path ----------------------------------------
 static id return_nil(id self, SEL _cmd) { return nil; }
@@ -59,23 +56,41 @@ static void hooked_setDelegate(PKPushRegistry *self, SEL cmd, id<PKPushRegistryD
     orig_setDelegate(self, cmd, d);
 }
 
-// ---- Fix 3: CKContainer swizzle -------------------------------------------
-// All paths that crash go through +[CKContainer containerWithIdentifier:].
-// CloudKit's internal dispatch_once throws inside this method on iOS 27.2 beta.
-// Swizzling lets us catch the ObjC exception before it enters any Swift frame.
+// ---- Fix 3: CloudKit dispatch_once bypass ----------------------------------
+// JonnyTwitterKit binary offsets (IDA base = 0x0):
+//   qword_4DC230  = swift_once token for CloudKitManager init (sub_5DE74)
+//   0x4FF8B8      = CloudKitManager.shared storage
+//
+// Strategy: pre-mark token as DONE so sub_5DE74 never executes,
+//           and point shared at a zeroed stub so *(shared+N) = nil for all N.
+//           ObjC nil messages are no-ops; CloudKit features degrade gracefully.
 
-static id (*orig_ckcontainer)(Class, SEL, NSString *);
+#define JTK_ONCE_TOKEN_OFFSET  0x4DC230
+#define JTK_SHARED_OFFSET      0x4FF8B8
 
-__attribute__((noinline))
-static id hooked_ckcontainer(Class cls, SEL sel, NSString *identifier) {
-    id result = nil;
-    @try {
-        result = orig_ckcontainer(cls, sel, identifier);
-    } @catch (NSException *e) {
-        NSLog(@"[spring_fix] caught CKContainer init exception: %@", e.reason);
-        result = nil;
+// 0xD0 = CloudKitManager's swift_allocObject requiredSize from sub_5DE90
+static uint8_t _ck_stub[0xD0] __attribute__((aligned(16)));
+
+static void setup_cloudkit_bypass(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "JonnyTwitterKit")) continue;
+
+        uintptr_t base = (uintptr_t)_dyld_get_image_header(i);
+
+        // Mark dispatch_once token as DONE (~0 = DLOCK_ONCE_DONE)
+        volatile int64_t *token = (volatile int64_t *)(base + JTK_ONCE_TOKEN_OFFSET);
+        *token = ~0LL;
+
+        // Point CloudKitManager.shared at our zeroed stub (non-nil)
+        void *volatile *shared = (void *volatile *)(base + JTK_SHARED_OFFSET);
+        *shared = _ck_stub;
+
+        NSLog(@"[spring_fix] CloudKit bypass: base=%p token=%p shared=%p",
+              (void *)base, (void *)token, (void *)shared);
+        break;
     }
-    return result;
 }
 
 // ---- Constructor -----------------------------------------------------------
@@ -100,16 +115,7 @@ static void spring_fix_init(void) {
         }
     }
 
-    // Fix 3: force-load CloudKit then swizzle CKContainer
-    dlopen("/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_LAZY | RTLD_GLOBAL);
-    Class ck = NSClassFromString(@"CKContainer");
-    if (ck) {
-        SEL sel = NSSelectorFromString(@"containerWithIdentifier:");
-        // class method → use metaclass
-        Method m = class_getClassMethod(ck, sel);
-        if (m) {
-            orig_ckcontainer = (id(*)(Class,SEL,NSString*))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_ckcontainer);
-        }
-    }
+    // Fix 3
+    memset(_ck_stub, 0, sizeof(_ck_stub));
+    setup_cloudkit_bypass();
 }
