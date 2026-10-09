@@ -1,0 +1,27 @@
+workflows:
+  build-dylib:
+    name: Build spring_fix.dylib
+    max_build_duration: 10
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+
+    scripts:
+      - name: Build arm64 dylib
+        script: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang \
+            -fobjc-arc \
+            -fvisibility=hidden \
+            -O2 \
+            -isysroot "$SDK" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -framework Foundation \
+            -install_name @rpath/spring_fix.dylib \
+            -o spring_fix.dylib \
+            spring_fix.m
+
+    artifacts:
+      - spring_fix.dylib
