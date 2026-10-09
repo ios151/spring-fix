@@ -1,25 +1,21 @@
 // spring_fix.dylib — fixes iOS 27.2 beta startup crashes in Spring for Twitter
 //
-// Root cause: CloudKit's internal dispatch_once (CloudKit +221924 calls block at +56600)
-// throws an NSException on iOS 27.2 beta. Because the block always throws, the
-// once-token is never set to DONE, so every CloudKit entry point triggers it again.
-// The exception propagates through Swift frames → std::terminate → crash.
+// Root cause: +[CKContainer containerWithIdentifier:] internally hits a
+// dispatch_once block (CloudKit +56600) that throws an NSException on iOS 27.2
+// beta. The exception propagates from CloudKit (ObjC/C) through Swift frames in
+// JonnyTwitterKit / JonnySocialKit → std::terminate → SIGABRT.
 //
 // Fix strategy:
 //  1. cloudKitContainerOptions → nil  (CoreData path, belt-and-suspenders)
 //  2. PKPushRegistry delegate proxy with @try/@catch (push-credentials path)
-//  3. Mark CloudKit's broken dispatch_once token as DONE before it ever runs
-//     — achieved by scanning for ADRP X0 + ADD X0 before the BL dispatch_once
-//       at CloudKit +221920 and writing -1L to that token address.
+//  3. Swizzle +[CKContainer containerWithIdentifier:] with @try/@catch
+//     Exception caught at ObjC level before it ever reaches Swift frames.
+//     Returns nil on failure; CloudKit features degrade gracefully.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <PushKit/PushKit.h>
 #import <dlfcn.h>
-#include <mach-o/dyld.h>
-#include <dispatch/dispatch.h>
-#include <string.h>
-#include <stdint.h>
 
 // ---- Fix 1: CoreData CloudKit path ----------------------------------------
 static id return_nil(id self, SEL _cmd) { return nil; }
@@ -63,57 +59,19 @@ static void hooked_setDelegate(PKPushRegistry *self, SEL cmd, id<PKPushRegistryD
     orig_setDelegate(self, cmd, d);
 }
 
-// ---- Fix 3: CloudKit dispatch_once token patch -----------------------------
-// CloudKit frame offsets (consistent across iOS 27.2 beta crashes):
-//   +221924 = return address after BL dispatch_once  → BL is at +221920
-//   +56600  = the crashing once-block
-//
-// We scan instructions backward from +221920 to find "ADRP X0, ..." + "ADD X0, X0, #imm"
-// which loads the once-token address into X0 (first arg of dispatch_once).
+// ---- Fix 3: CKContainer swizzle -------------------------------------------
+// All paths that crash go through +[CKContainer containerWithIdentifier:].
+// CloudKit's internal dispatch_once throws inside this method on iOS 27.2 beta.
+// Swizzling lets us catch the ObjC exception before it enters any Swift frame.
 
-static dispatch_once_t *find_ck_token(uintptr_t ck_base) {
-    // BL instruction is one word before the frame return address
-    uint32_t *bl_site = (uint32_t *)(ck_base + 221924) - 1; // = ck_base + 221920
+static id (*orig_ckcontainer)(Class, SEL, NSString *);
 
-    for (int i = 1; i <= 16; i++) {
-        uint32_t adrp = bl_site[-i];
-        // ADRP X0: op=ADRP(0x90000000), Rd=X0(bits[4:0]=0)
-        if ((adrp & 0x9F00001F) != 0x90000000) continue;
-
-        uint32_t add = bl_site[-i + 1];
-        // ADD X0, X0, #imm12[,shift]: bits[31:22]=0x244, Rn=0, Rd=0
-        if ((add & 0xFFC003FF) != 0x91000000) continue;
-
-        // Decode ADRP: imm21 = {immhi[18:0], immlo[1:0]}
-        int64_t immlo = (adrp >> 29) & 3;
-        int64_t immhi = (int64_t)(uint64_t)((adrp & 0x00FFFFE0) >> 5); // 19 bits unsigned
-        int64_t imm21 = (immhi << 2) | immlo;
-        if (imm21 & (1LL << 20)) imm21 -= (1LL << 21); // sign-extend 21→64
-
-        uintptr_t page = ((uintptr_t)&bl_site[-i] & ~(uintptr_t)0xFFF) + (uintptr_t)(imm21 << 12);
-
-        // Decode ADD: imm12 at bits[21:10], shift flag at bit[22]
-        uint32_t imm12 = (add >> 10) & 0xFFF;
-        uint32_t sh    = (add >> 22) & 1;
-        uintptr_t off  = sh ? ((uintptr_t)imm12 << 12) : (uintptr_t)imm12;
-
-        return (dispatch_once_t *)(page + off);
-    }
-    return NULL;
-}
-
-static void patch_cloudkit_if_needed(const struct mach_header *mh,
-                                     intptr_t slide __unused) {
-    // Check all loaded images for CloudKit
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        if ((const struct mach_header *)_dyld_get_image_header(i) != mh) continue;
-        const char *name = _dyld_get_image_name(i);
-        if (!name || !strstr(name, "CloudKit.framework/CloudKit")) break;
-
-        dispatch_once_t *tok = find_ck_token((uintptr_t)mh);
-        if (tok) __atomic_store_n(tok, ~0L, __ATOMIC_SEQ_CST); // DISPATCH_ONCE_DONE
-        break;
+static id hooked_ckcontainer(Class cls, SEL sel, NSString *identifier) {
+    @try {
+        return orig_ckcontainer(cls, sel, identifier);
+    } @catch (NSException *e) {
+        NSLog(@"[spring_fix] caught CKContainer exception: %@", e.reason);
+        return nil;
     }
 }
 
@@ -139,9 +97,16 @@ static void spring_fix_init(void) {
         }
     }
 
-    // Fix 3: _dyld_register_func_for_add_image calls the callback immediately
-    // for every image already loaded, then again for each new image.
-    // CloudKit is statically linked by JonnySocialKit/JonnyTwitterKit so it
-    // should already be present.
-    _dyld_register_func_for_add_image(patch_cloudkit_if_needed);
+    // Fix 3: force-load CloudKit then swizzle CKContainer
+    dlopen("/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_LAZY | RTLD_GLOBAL);
+    Class ck = NSClassFromString(@"CKContainer");
+    if (ck) {
+        SEL sel = NSSelectorFromString(@"containerWithIdentifier:");
+        // class method → use metaclass
+        Method m = class_getClassMethod(ck, sel);
+        if (m) {
+            orig_ckcontainer = (id(*)(Class,SEL,NSString*))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_ckcontainer);
+        }
+    }
 }
