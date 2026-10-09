@@ -17,8 +17,12 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun clang \
             -fobjc-arc \
+            -fobjc-exceptions \
+            -fexceptions \
+            -funwind-tables \
+            -fno-optimize-sibling-calls \
             -fvisibility=hidden \
-            -O2 \
+            -O1 \
             -isysroot "$SDK" \
             -arch arm64 \
             -miphoneos-version-min=15.0 \

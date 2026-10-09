@@ -66,13 +66,16 @@ static void hooked_setDelegate(PKPushRegistry *self, SEL cmd, id<PKPushRegistryD
 
 static id (*orig_ckcontainer)(Class, SEL, NSString *);
 
+__attribute__((noinline))
 static id hooked_ckcontainer(Class cls, SEL sel, NSString *identifier) {
+    id result = nil;
     @try {
-        return orig_ckcontainer(cls, sel, identifier);
+        result = orig_ckcontainer(cls, sel, identifier);
     } @catch (NSException *e) {
-        NSLog(@"[spring_fix] caught CKContainer exception: %@", e.reason);
-        return nil;
+        NSLog(@"[spring_fix] caught CKContainer init exception: %@", e.reason);
+        result = nil;
     }
+    return result;
 }
 
 // ---- Constructor -----------------------------------------------------------
