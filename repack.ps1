@@ -13,7 +13,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $zip = [System.IO.Compression.ZipFile]::Open($cleanIpa, 'Create')
 Get-ChildItem -LiteralPath $payloadDir -Recurse -File | ForEach-Object {
-    $rel = "Payload\" + $_.FullName.Substring($payloadDir.Length + 1)
+    $rel = ("Payload/" + $_.FullName.Substring($payloadDir.Length + 1)).Replace("\", "/")
     try {
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $rel, 'Optimal') | Out-Null
     } catch {
